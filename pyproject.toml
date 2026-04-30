@@ -1,0 +1,40 @@
+[project]
+name = "traininghub"
+version = "0.1.0"
+description = "Standalone FastAPI and React platform for local training workflows on Morrigan."
+requires-python = ">=3.10"
+dependencies = [
+  "datasets>=2.20.0",
+  "fastapi>=0.115.0",
+  "huggingface_hub>=0.30.0",
+  "numpy>=1.26.0",
+  "python-multipart>=0.0.9",
+  "uvicorn[standard]>=0.30.0",
+  "pydantic>=2.7.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "httpx>=0.27.0",
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+]
+ml = [
+  "accelerate",
+  "bitsandbytes",
+  "datasets",
+  "lm_eval",
+  "peft",
+  "sentencepiece",
+  "tiktoken",
+  "torch",
+  "transformers",
+  "trl",
+]
+llama = [
+  "llama-cpp-python>=0.3.9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+pythonpath = ["backend"]
