@@ -82,6 +82,8 @@ class TrainingJobRequest(BaseModel):
     target_modules: list[str] = Field(default_factory=list)
     merge_adapter: bool | None = None
     gpu_ids: list[int] | None = None
+    requested_gpu_count: int | None = Field(default=None, ge=1, le=16)
+    allow_gpu_overlap: bool = False
     dry_run: bool = False
 
 

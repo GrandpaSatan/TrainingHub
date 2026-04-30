@@ -13,7 +13,7 @@ from traininghub.core.database import connect, row_to_dict, rows_to_dicts
 from traininghub.core.id_utils import make_job_id, slugify
 from traininghub.core.security import utc_now
 from traininghub.services.datasets import get_approved_version
-from traininghub.services.gpu import choose_gpu_ids
+from traininghub.services.gpu import GpuAllocation, GpuAllocationError, choose_gpu_allocation
 from traininghub.services.inference_run import shutdown_inference_for_training
 from traininghub.services.training import validate_training_payload
 
@@ -62,7 +62,10 @@ WORKER_MODULES = {
 
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 TRAINING_JOB_TYPES = {"train_lora", "train_qlora", "train_full"}
+BENCHMARK_JOB_TYPES = {"benchmark", "benchmark_mmlu", "benchmark_hellaswag", "benchmark_arc", "benchmark_ifeval", "benchmark_code"}
+GPU_JOB_TYPES = TRAINING_JOB_TYPES | BENCHMARK_JOB_TYPES | {"generate", "extract_capability", "align_capability"}
 DEFAULT_PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+FULL_TRAINING_MIN_GPUS = 2
 
 
 class JobValidationError(ValueError):
@@ -98,8 +101,13 @@ def create_and_start_job(settings: Settings, job_type: str, slug: str, payload: 
     work_dir = settings.data_root / "jobs" / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
     payload_path = work_dir / "payload.json"
+    try:
+        gpu_allocation = _allocate_gpus(settings, job_type, payload)
+    except GpuAllocationError as exc:
+        raise JobValidationError(str(exc)) from exc
+    _apply_gpu_payload_metadata(job_type, payload, gpu_allocation)
     payload_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    gpu_ids = choose_gpu_ids(settings.database_path, payload.get("gpu_ids"))
+    gpu_ids = gpu_allocation.gpu_ids
     now = utc_now()
     with connect(settings.database_path) as conn:
         conn.execute(
@@ -131,10 +139,19 @@ def create_and_start_job(settings: Settings, job_type: str, slug: str, payload: 
             INSERT INTO job_events (job_id, created_at, event_type, level, message, data_json)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (job_id, now, "queued", "info", "Job queued.", json.dumps({"job_type": job_type})),
+            (
+                job_id,
+                now,
+                "queued",
+                "info",
+                "Job queued.",
+                json.dumps({"job_type": job_type, "gpu_allocation": gpu_allocation.as_event_data()}, sort_keys=True),
+            ),
         )
+    shutdown_result: dict[str, Any] | None = None
     if job_type in TRAINING_JOB_TYPES:
         shutdown_result = shutdown_inference_for_training()
+    if shutdown_result is not None:
         with connect(settings.database_path) as conn:
             conn.execute(
                 """
@@ -150,7 +167,7 @@ def create_and_start_job(settings: Settings, job_type: str, slug: str, payload: 
                     json.dumps(shutdown_result, sort_keys=True),
                 ),
             )
-    _spawn_worker(settings, job_id, WORKER_MODULES[job_type], payload_path, work_dir, gpu_ids)
+    _spawn_worker(settings, job_id, WORKER_MODULES[job_type], payload_path, work_dir, gpu_allocation, payload)
     return get_job(settings.database_path, job_id) or {"job_id": job_id}
 
 
@@ -175,15 +192,75 @@ def _validate_job_request(settings: Settings, job_type: str, payload: dict[str, 
             raise JobValidationError(str(exc)) from exc
 
 
+def _allocate_gpus(settings: Settings, job_type: str, payload: dict[str, Any]) -> GpuAllocation:
+    if job_type not in GPU_JOB_TYPES or payload.get("dry_run", False) or not settings.real_workers_enabled:
+        return choose_gpu_allocation(settings.database_path, requested_gpu_count=0, strategy="none")
+
+    requested_gpu_ids = payload.get("gpu_ids")
+    requested_gpu_count = int(payload.get("requested_gpu_count") or _default_gpu_count(job_type))
+    allow_overlap = bool(payload.get("allow_gpu_overlap", False))
+    strategy = _gpu_strategy(job_type, requested_gpu_ids, requested_gpu_count)
+
+    if job_type == "train_full":
+        explicit_count = len(requested_gpu_ids or [])
+        if requested_gpu_ids and explicit_count < FULL_TRAINING_MIN_GPUS:
+            raise GpuAllocationError(
+                f"Full fine-tuning requires at least {FULL_TRAINING_MIN_GPUS} GPUs for balanced model-parallel training."
+            )
+        requested_gpu_count = max(requested_gpu_count, FULL_TRAINING_MIN_GPUS)
+
+    return choose_gpu_allocation(
+        settings.database_path,
+        requested_gpu_ids=requested_gpu_ids,
+        requested_gpu_count=requested_gpu_count,
+        allow_overlap=allow_overlap,
+        require_gpu=settings.real_workers_enabled and job_type in TRAINING_JOB_TYPES,
+        strategy=strategy,
+    )
+
+
+def _default_gpu_count(job_type: str) -> int:
+    return FULL_TRAINING_MIN_GPUS if job_type == "train_full" else 1
+
+
+def _gpu_strategy(job_type: str, requested_gpu_ids: list[int] | None, requested_gpu_count: int) -> str:
+    if job_type == "train_full":
+        return "balanced_model_parallel"
+    if requested_gpu_ids and len(requested_gpu_ids) > 1:
+        return "visible_device_map"
+    if requested_gpu_count > 1:
+        return "visible_device_map"
+    return "single_most_free"
+
+
+def _apply_gpu_payload_metadata(job_type: str, payload: dict[str, Any], allocation: GpuAllocation) -> None:
+    payload["resolved_gpu_ids"] = allocation.gpu_ids
+    payload["gpu_allocation"] = allocation.as_event_data()
+    payload["training_launch_mode"] = "single_process"
+    if job_type == "train_full" and len(allocation.gpu_ids) >= FULL_TRAINING_MIN_GPUS:
+        payload["training_device_map"] = "balanced"
+        payload["training_launch_mode"] = "single_process_model_parallel"
+    elif len(allocation.gpu_ids) > 1:
+        payload["training_device_map"] = "auto"
+
+
 def _spawn_worker(
     settings: Settings,
     job_id: str,
     worker_module: str,
     payload_path: Path,
     work_dir: Path,
-    gpu_ids: list[int],
+    gpu_allocation: GpuAllocation,
+    payload: dict[str, Any],
 ) -> None:
-    env = _worker_env(settings, job_id, work_dir, gpu_ids)
+    env = _worker_env(
+        settings,
+        job_id,
+        work_dir,
+        gpu_allocation.gpu_ids,
+        gpu_strategy=gpu_allocation.strategy,
+        training_device_map=payload.get("training_device_map"),
+    )
     stdout_path = work_dir / "stdout.log"
     stderr_path = work_dir / "stderr.log"
     stdout_handle = stdout_path.open("ab")
@@ -223,15 +300,33 @@ def _spawn_worker(
                 "started",
                 "info",
                 "Worker process started.",
-                json.dumps({"pid": process.pid, "command": command, "gpu_ids": gpu_ids}),
+                json.dumps(
+                    {
+                        "pid": process.pid,
+                        "command": command,
+                        "gpu_ids": gpu_allocation.gpu_ids,
+                        "gpu_allocation": gpu_allocation.as_event_data(),
+                        "launch_mode": payload.get("training_launch_mode", "single_process"),
+                        "training_device_map": payload.get("training_device_map"),
+                    },
+                    sort_keys=True,
+                ),
             ),
         )
 
 
-def _worker_env(settings: Settings, job_id: str, work_dir: Path, gpu_ids: list[int]) -> dict[str, str]:
+def _worker_env(
+    settings: Settings,
+    job_id: str,
+    work_dir: Path,
+    gpu_ids: list[int],
+    gpu_strategy: str | None = None,
+    training_device_map: Any | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
         {
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
             "PYTHONPATH": str(settings.app_root / "backend") + os.pathsep + env.get("PYTHONPATH", ""),
             "TRAININGHUB_DATABASE_PATH": str(settings.database_path),
             "TRAININGHUB_DATA_ROOT": str(settings.data_root),
@@ -239,6 +334,8 @@ def _worker_env(settings: Settings, job_id: str, work_dir: Path, gpu_ids: list[i
             "TRAININGHUB_JOB_DIR": str(work_dir),
             "TRAININGHUB_GPU_IDS": ",".join(str(gpu_id) for gpu_id in gpu_ids),
             "CUDA_VISIBLE_DEVICES": ",".join(str(gpu_id) for gpu_id in gpu_ids),
+            "TRAININGHUB_GPU_STRATEGY": gpu_strategy or "",
+            "TRAININGHUB_TRAINING_DEVICE_MAP": str(training_device_map or ""),
             "TRAININGHUB_ENABLE_REAL_WORKERS": "1" if settings.real_workers_enabled else "0",
             "PYTORCH_CUDA_ALLOC_CONF": env.get("PYTORCH_CUDA_ALLOC_CONF", DEFAULT_PYTORCH_CUDA_ALLOC_CONF),
         }

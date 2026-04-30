@@ -83,10 +83,11 @@ def _train_real(context: WorkerContext, payload: dict[str, Any], checkpoint_dir:
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    device_map = _training_device_map(payload, torch)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
+        device_map=device_map,
         trust_remote_code=True,
     )
     _enable_memory_saving_training(model)
@@ -113,7 +114,16 @@ def _train_real(context: WorkerContext, payload: dict[str, Any], checkpoint_dir:
         data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
         callbacks=[telemetry],
     )
-    context.event("training_start", "Starting full fine-tuning.", data={"row_count": len(rows)})
+    context.event(
+        "training_start",
+        "Starting full fine-tuning.",
+        data={
+            "row_count": len(rows),
+            "gpu_ids": payload.get("resolved_gpu_ids", []),
+            "launch_mode": payload.get("training_launch_mode", "single_process"),
+            "training_device_map": device_map,
+        },
+    )
     started_at = telemetry.started_at
     train_output = trainer.train()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -121,6 +131,13 @@ def _train_real(context: WorkerContext, payload: dict[str, Any], checkpoint_dir:
     tokenizer.save_pretrained(str(checkpoint_dir))
     context.check_cancelled()
     return normalize_training_summary(train_output, telemetry, started_at)
+
+
+def _training_device_map(payload: dict[str, Any], torch: Any) -> str | None:
+    if not torch.cuda.is_available():
+        return None
+    device_map = str(payload.get("training_device_map") or "").strip()
+    return device_map or "auto"
 
 
 def _enable_memory_saving_training(model: Any) -> None:

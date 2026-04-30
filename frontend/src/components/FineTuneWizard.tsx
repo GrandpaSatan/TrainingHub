@@ -132,7 +132,7 @@ const LARGE_LORA_MODEL_BILLIONS = 4;
 const SAFE_LORA_SEQUENCE_LENGTH = 1024;
 
 function estimateVramGb(model: ModelRecord, mode: Mode, batch: number, maxSequenceLength: number): string {
-  const estimate = estimateVramGbNumber(model, mode, batch, maxSequenceLength);
+  const estimate = estimatePlannedVramGbNumber(model, mode, batch, maxSequenceLength);
   return estimate === null ? "—" : `${estimate.toFixed(1)} GB`;
 }
 
@@ -144,6 +144,20 @@ function estimateVramGbNumber(model: ModelRecord, mode: Mode, batch: number, max
   if (mode === "qlora") return billions * 0.9 + billions * 0.25 * sequenceScale + batchOverhead + 0.8;
   if (mode === "lora") return billions * 2.1 + billions * 0.6 * sequenceScale + batchOverhead + 0.7;
   return billions * 14 + billions * 1.4 * sequenceScale + batchOverhead + 1.5;
+}
+
+function estimatePlannedVramGbNumber(model: ModelRecord, mode: Mode, batch: number, maxSequenceLength: number): number | null {
+  const estimate = estimateVramGbNumber(model, mode, batch, maxSequenceLength);
+  if (estimate === null) return null;
+  return mode === "full" ? estimate / plannedGpuCount(mode) : estimate;
+}
+
+function plannedGpuCount(mode: Mode): number {
+  return mode === "full" ? 2 : 1;
+}
+
+function allocationModeLabel(mode: Mode): string {
+  return mode === "full" ? "2 GPU balanced" : "1 GPU most-free";
 }
 
 function estimateTrainingRuntime(model: ModelRecord, mode: Mode, maxSteps: number, batch: number, ga: number, maxSequenceLength: number): string {
@@ -203,11 +217,11 @@ function trainingMemoryRisk(model: ModelRecord, mode: Mode, maxSequenceLength: n
       message: `${model.display_name} LoRA at ${maxSequenceLength} tokens exceeds the ${MORRIGAN_GPU_BUDGET_GB} GB GPU budget. Use QLoRA or ${SAFE_LORA_SEQUENCE_LENGTH} tokens.`,
     };
   }
-  const estimate = estimateVramGbNumber(model, mode, 1, maxSequenceLength);
+  const estimate = estimatePlannedVramGbNumber(model, mode, 1, maxSequenceLength);
   if (estimate !== null && estimate >= MORRIGAN_GPU_BUDGET_GB) {
     return {
       blocking: false,
-      message: `Estimated VRAM is ${estimate.toFixed(1)} GB on a ${MORRIGAN_GPU_BUDGET_GB} GB GPU. QLoRA is safer for this model.`,
+      message: `Estimated VRAM is ${estimate.toFixed(1)} GB per device on a ${MORRIGAN_GPU_BUDGET_GB} GB GPU. QLoRA is safer for this model.`,
     };
   }
   return null;
@@ -532,6 +546,7 @@ export function FineTuneWizard({
         per_device_train_batch_size: batchSize,
         gradient_accumulation_steps: gradientAccumulation,
         max_sequence_length: maxSequenceLength,
+        requested_gpu_count: plannedGpuCount(mode),
         lora_rank: mode === "full" ? undefined : loraRank,
         merge_adapter: mode === "full" ? undefined : mergeAdapter,
       });
@@ -1485,6 +1500,11 @@ function SectionAllocate({
               <span className="vmono">// per device · ctx {maxSequenceLength}</span>
             </div>
             <div className="thx-summary-item">
+              <span className="k">GPU PLAN</span>
+              <span className="v">{plannedGpuCount(mode)}</span>
+              <span className="vmono">// {allocationModeLabel(mode)}</span>
+            </div>
+            <div className="thx-summary-item">
               <span className="k">EST. WALLTIME</span>
               <span className="v">{estimateTrainingRuntime(selectedModel, mode, maxSteps, batchSize, gradientAccumulation, maxSequenceLength)}</span>
               <span className="vmono">// {maxSteps} steps</span>
@@ -1573,6 +1593,11 @@ function SectionDeploy({
       label: "GPU_MEMORY_BUDGET",
       ok: !memoryRisk?.blocking,
       detail: memoryRisk?.message || (selectedModel ? `${estimateVramGb(selectedModel, mode, batchSize, maxSequenceLength)} estimated at ${maxSequenceLength} tokens` : "no model selected"),
+    },
+    {
+      label: "GPU_ALLOCATION",
+      ok: true,
+      detail: `${plannedGpuCount(mode)} requested · ${allocationModeLabel(mode)}`,
     },
     {
       label: "OUTPUT_NAME",
@@ -1784,7 +1809,7 @@ function SectionObserve({
                 >
                   <span className="thx-run-dot" />
                   <span className="thx-run-id">{j.job_id}</span>
-                  <span className="thx-run-meta">{j.job_type}</span>
+                  <span className="thx-run-meta">{j.job_type} · {jobGpuPlan(j)}</span>
                   <span className="thx-run-status">{j.status}</span>
                 </button>
               );
@@ -1817,6 +1842,12 @@ function SectionObserve({
       </div>
     </section>
   );
+}
+
+function jobGpuPlan(job: JobRecord): string {
+  const allocation = job.payload.gpu_allocation as { strategy?: string } | undefined;
+  const gpuText = job.gpu_ids.length ? job.gpu_ids.map((id) => `GPU${id}`).join("+") : "no GPU";
+  return allocation?.strategy ? `${gpuText} · ${allocation.strategy}` : gpuText;
 }
 
 function useTrainingJobEvents(jobs: JobRecord[]): Record<string, TrainingJobEvent[]> {

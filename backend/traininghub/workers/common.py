@@ -209,6 +209,9 @@ def runtime_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         "env": {
             "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES", ""),
             "PYTORCH_CUDA_ALLOC_CONF": os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""),
+            "TRAININGHUB_GPU_IDS": os.getenv("TRAININGHUB_GPU_IDS", ""),
+            "TRAININGHUB_GPU_STRATEGY": os.getenv("TRAININGHUB_GPU_STRATEGY", ""),
+            "TRAININGHUB_TRAINING_DEVICE_MAP": os.getenv("TRAININGHUB_TRAINING_DEVICE_MAP", ""),
             "TRAININGHUB_ENABLE_REAL_WORKERS": os.getenv("TRAININGHUB_ENABLE_REAL_WORKERS", "0"),
         },
         "payload_keys": sorted(payload.keys()),
