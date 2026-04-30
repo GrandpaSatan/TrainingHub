@@ -27,6 +27,20 @@ CSV_COLUMNS = [
     "notes",
 ]
 
+CALIBRATION_CSV_COLUMNS = [
+    "id",
+    "prompt_present",
+    "prompt_absent",
+    "continuation_prefix",
+    "system_present",
+    "system_absent",
+    "prompt",
+    "source",
+    "split",
+    "tags",
+    "notes",
+]
+
 ALLOWED_SPLITS = {"train", "validation", "holdout"}
 KNOWN_BENCHMARK_PROMPT_FRAGMENTS = [
     "janet's ducks lay 16 eggs per day",
@@ -38,6 +52,26 @@ KNOWN_BENCHMARK_PROMPT_FRAGMENTS = [
 
 def build_template(dataset_type: str = "math_sft") -> str:
     output = io.StringIO()
+    if dataset_type == "capability_calibration":
+        writer = csv.DictWriter(output, fieldnames=CALIBRATION_CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "id": "calibration_001",
+                "prompt_present": "Solve this step by step before giving the answer: What is 17 + 25?",
+                "prompt_absent": "Give only the final answer: What is 17 + 25?",
+                "continuation_prefix": "",
+                "system_present": "",
+                "system_absent": "",
+                "prompt": "",
+                "source": "manual",
+                "split": "holdout",
+                "tags": "calibration,reasoning",
+                "notes": "Prompt-pair contrast example.",
+            }
+        )
+        return output.getvalue()
+
     writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
     writer.writeheader()
     writer.writerow(
@@ -83,7 +117,8 @@ def validate_csv_text(csv_text: str, dataset_type: str, max_sequence_length: int
         reader = csv.DictReader(io.StringIO(csv_text))
         if reader.fieldnames is None:
             raise csv.Error("missing header row")
-        missing_columns = [column for column in CSV_COLUMNS if column not in reader.fieldnames]
+        expected_columns = _csv_columns(dataset_type)
+        missing_columns = [column for column in expected_columns if column not in reader.fieldnames]
         if missing_columns:
             errors.append(
                 {
@@ -96,8 +131,13 @@ def validate_csv_text(csv_text: str, dataset_type: str, max_sequence_length: int
             return {"valid": False, "errors": errors, "warnings": warnings, "rows": [], "accepted_count": 0}
 
         for row_number, row in enumerate(reader, start=2):
-            cleaned = {column: (row.get(column) or "").strip() for column in CSV_COLUMNS}
-            row_errors = _validate_row(cleaned, row_number, dataset_type, max_sequence_length, seen_ids, seen_pairs)
+            cleaned = {column: (row.get(column) or "").strip() for column in expected_columns}
+            if dataset_type == "capability_calibration":
+                if not cleaned["split"]:
+                    cleaned["split"] = "holdout"
+                row_errors = _validate_calibration_row(cleaned, row_number, max_sequence_length, seen_ids, seen_pairs)
+            else:
+                row_errors = _validate_row(cleaned, row_number, dataset_type, max_sequence_length, seen_ids, seen_pairs)
             errors.extend(row_errors)
             if not row_errors:
                 _append_leakage_warnings(cleaned, row_number, warnings)
@@ -112,6 +152,12 @@ def validate_csv_text(csv_text: str, dataset_type: str, max_sequence_length: int
         "rows": rows,
         "accepted_count": 0 if errors else len(rows),
     }
+
+
+def _csv_columns(dataset_type: str) -> list[str]:
+    if dataset_type == "capability_calibration":
+        return CALIBRATION_CSV_COLUMNS
+    return CSV_COLUMNS
 
 
 def _validate_row(
@@ -154,6 +200,60 @@ def _validate_row(
     return errors
 
 
+def _validate_calibration_row(
+    row: dict[str, str],
+    row_number: int,
+    max_sequence_length: int,
+    seen_ids: set[str],
+    seen_pairs: set[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    prompt_present = row["prompt_present"]
+    prompt_absent = row["prompt_absent"]
+    system_present = row["system_present"]
+    system_absent = row["system_absent"]
+    prompt = row["prompt"]
+    has_prompt_pair = bool(prompt_present and prompt_absent)
+    has_system_pair = bool(system_present and system_absent and prompt)
+    if not has_prompt_pair and not has_system_pair:
+        errors.append(
+            _error(
+                row_number,
+                "prompt_present",
+                "required_contrast_pair",
+                "Provide prompt_present and prompt_absent, or system_present, system_absent, and prompt.",
+            )
+        )
+    if row["split"] and row["split"] not in ALLOWED_SPLITS:
+        errors.append(_error(row_number, "split", "invalid_split", "Use train, validation, or holdout."))
+    if row["id"]:
+        if row["id"] in seen_ids:
+            errors.append(_error(row_number, "id", "duplicate_id", "Duplicate id in this upload."))
+        seen_ids.add(row["id"])
+    pair = (
+        (prompt_present or f"{system_present}\n{prompt}").casefold(),
+        (prompt_absent or f"{system_absent}\n{prompt}").casefold(),
+    )
+    if pair != ("", ""):
+        if pair in seen_pairs:
+            errors.append(_error(row_number, "prompt_present", "duplicate_contrast_pair", "Duplicate contrast pair in this upload."))
+        seen_pairs.add(pair)
+    approximate_tokens = max(
+        1,
+        len((prompt_present + prompt_absent + row["continuation_prefix"] + system_present + system_absent + prompt).split()),
+    )
+    if approximate_tokens > max_sequence_length:
+        errors.append(
+            _error(
+                row_number,
+                "prompt_present",
+                "too_long",
+                f"Approximate token count {approximate_tokens} exceeds max sequence length {max_sequence_length}.",
+            )
+        )
+    return errors
+
+
 def _append_leakage_warnings(row: dict[str, str], row_number: int, warnings: list[dict[str, Any]]) -> None:
     prompt = row["prompt"].casefold()
     source = row["source"].casefold()
@@ -183,7 +283,31 @@ def _warning(row_number: int, field: str, code: str, message: str) -> dict[str, 
     return {"row_number": row_number, "field": field, "code": code, "message": message}
 
 
-def canonical_record(row: dict[str, str]) -> dict[str, Any]:
+def canonical_record(row: dict[str, str], dataset_type: str = "math_sft") -> dict[str, Any]:
+    if dataset_type == "capability_calibration":
+        record = {
+            key: row[key]
+            for key in [
+                "prompt_present",
+                "prompt_absent",
+                "continuation_prefix",
+                "system_present",
+                "system_absent",
+                "prompt",
+            ]
+            if row.get(key)
+        }
+        tags = [tag.strip() for tag in row["tags"].split(",") if tag.strip()]
+        record["metadata"] = {
+            "id": row["id"],
+            "source": row["source"],
+            "split": row["split"] or "holdout",
+            "tags": tags,
+            "notes": row["notes"],
+            "dataset_type": dataset_type,
+        }
+        return record
+
     messages = []
     if row["system"]:
         messages.append({"role": "system", "content": row["system"]})
@@ -235,7 +359,7 @@ def create_dataset_version(
     rows = validation["rows"]
     with jsonl_path.open("w", encoding="utf-8") as handle:
         for row in rows:
-            handle.write(json.dumps(canonical_record(row), sort_keys=True) + "\n")
+            handle.write(json.dumps(canonical_record(row, dataset_type), sort_keys=True) + "\n")
 
     split_counts = Counter(row["split"] for row in rows)
     now = utc_now()
@@ -606,6 +730,15 @@ def read_review_sample(database_path: Path, dataset_id: str, sample_size: int = 
 
 
 def _dataset_record_view(index: int, record: dict[str, Any]) -> dict[str, Any]:
+    if "messages" not in record:
+        metadata = record.get("metadata", {})
+        return {
+            "index": index,
+            "system": str(record.get("system_present") or ""),
+            "prompt": str(record.get("prompt_present") or record.get("prompt") or ""),
+            "response": str(record.get("prompt_absent") or record.get("system_absent") or ""),
+            "metadata": metadata,
+        }
     messages = record.get("messages", [])
     metadata = record.get("metadata", {})
     role_content = {message.get("role", ""): message.get("content", "") for message in messages if isinstance(message, dict)}

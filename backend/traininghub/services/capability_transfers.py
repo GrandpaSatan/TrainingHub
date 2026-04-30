@@ -8,6 +8,7 @@ from traininghub.core.config import Settings
 from traininghub.core.database import connect, row_to_dict, rows_to_dicts
 from traininghub.core.id_utils import make_job_id, slugify
 from traininghub.core.security import utc_now
+from traininghub.services.calibration_pairs import CalibrationDatasetError, validate_calibration_dataset
 from traininghub.services.datasets import get_approved_version
 from traininghub.services.deletion import safe_remove_traininghub_path
 from traininghub.services.inference import RUNNABLE_GGUF_TYPES, get_active_inference_target, set_active_inference_target
@@ -48,12 +49,12 @@ def get_transfer(database_path: Path, transfer_id: str, include_deleted: bool = 
 def create_transfer(settings: Settings, payload: dict[str, Any]) -> dict[str, Any]:
     source = _validate_endpoint_ref(settings.database_path, "source", payload)
     target = _validate_endpoint_ref(settings.database_path, "target", payload)
-    calibration = _approved_calibration(settings.database_path, str(payload.get("calibration_dataset_id") or ""))
     rank = _int_range(payload.get("rank", 16), 1, 256, "rank")
     layer_targets = _normalize_layer_targets(payload.get("layer_targets", "all"))
     contrast_mode = str(payload.get("contrast_mode") or "prompt_pair")
     if contrast_mode not in {"prompt_pair", "system_pair"}:
         raise CapabilityTransferError("contrast_mode must be prompt_pair or system_pair.")
+    calibration = _approved_calibration(settings.database_path, str(payload.get("calibration_dataset_id") or ""), contrast_mode)
     display_name = str(payload.get("display_name") or "").strip() or f"{source['display_name']} to {target['display_name']}"
     transfer_id = make_job_id("ct", display_name)
     now = utc_now()
@@ -295,7 +296,8 @@ def validate_capability_job_payload(settings: Settings, job_type: str, payload: 
     if job_type == "align_capability" and transfer["status"] not in {"aligning", "failed"}:
         raise CapabilityTransferError("Capability alignment job is not valid for the current transfer status.")
     calibration_dataset_id = str(payload.get("calibration_dataset_id") or transfer["config"].get("calibration_dataset_id") or "")
-    _approved_calibration(settings.database_path, calibration_dataset_id)
+    contrast_mode = str(payload.get("contrast_mode") or transfer["config"].get("contrast_mode") or "prompt_pair")
+    _approved_calibration(settings.database_path, calibration_dataset_id, contrast_mode)
     if job_type == "align_capability":
         vector_id = str(payload.get("vector_artifact_id") or "")
         if not vector_id or not _get_artifact(settings.database_path, vector_id):
@@ -385,12 +387,21 @@ def _target_payload_for_transfer(transfer: dict[str, Any]) -> dict[str, Any]:
     return {"target_type": "gguf_artifact", "model_slug": transfer["target_model_slug"], "artifact_id": artifact_id}
 
 
-def _approved_calibration(database_path: Path, dataset_id: str) -> dict[str, Any]:
+def _approved_calibration(database_path: Path, dataset_id: str, contrast_mode: str) -> dict[str, Any]:
     if not dataset_id:
         raise CapabilityTransferError("calibration_dataset_id is required.")
     approved = get_approved_version(database_path, dataset_id)
     if not approved:
         raise CapabilityTransferError("Calibration dataset must be approved before use.")
+    with connect(database_path) as conn:
+        dataset = conn.execute("SELECT dataset_type FROM datasets WHERE dataset_id = ?", (dataset_id,)).fetchone()
+    if not dataset or dataset["dataset_type"] != "capability_calibration":
+        raise CapabilityTransferError("Calibration dataset must use dataset_type capability_calibration.")
+    try:
+        summary = validate_calibration_dataset(Path(str(approved["jsonl_path"])), contrast_mode)
+    except CalibrationDatasetError as exc:
+        raise CapabilityTransferError(str(exc)) from exc
+    approved["calibration_pair_count"] = summary["pair_count"]
     approved["dataset_id"] = dataset_id
     return approved
 

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from fastapi.testclient import TestClient
+from httpx import Response
 
-from conftest import upload_and_approve_dataset, wait_for_job
+from conftest import (
+    upload_and_approve_calibration_dataset,
+    upload_and_approve_dataset,
+    upload_and_approve_system_calibration_dataset,
+    wait_for_job,
+)
 
 
 def test_capability_transfer_dry_run_lifecycle(authed: TestClient) -> None:
-    dataset_id = upload_and_approve_dataset(authed)
+    dataset_id = upload_and_approve_calibration_dataset(authed)
 
     create = authed.post(
         "/api/capability-transfers",
@@ -92,3 +98,83 @@ def test_capability_transfer_rejects_unapproved_dataset(authed: TestClient) -> N
 
     assert response.status_code == 400
     assert "Calibration dataset" in response.json()["detail"]
+
+
+def test_capability_transfer_rejects_non_calibration_dataset_before_queue(authed: TestClient) -> None:
+    dataset_id = upload_and_approve_dataset(authed)
+
+    response = authed.post(
+        "/api/capability-transfers",
+        json={
+            "display_name": "Wrong Dataset",
+            "source_model_slug": "lfm25-12b-instruct",
+            "source_runtime": "transformers",
+            "target_model_slug": "lfm25-12b-instruct",
+            "target_runtime": "transformers",
+            "calibration_dataset_id": dataset_id,
+            "layer_targets": "all",
+            "contrast_mode": "prompt_pair",
+            "rank": 8,
+            "dry_run": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "dataset_type capability_calibration" in response.json()["detail"]
+    assert authed.get("/api/capability-transfers").json() == []
+    assert [job for job in authed.get("/api/jobs").json() if job["job_type"] == "extract_capability"] == []
+
+
+def test_capability_transfer_accepts_system_pair_calibration(authed: TestClient) -> None:
+    dataset_id = upload_and_approve_system_calibration_dataset(authed)
+
+    create = _post_capability_transfer(authed, dataset_id, "system_pair", layer_targets="last")
+
+    assert create.status_code == 200, create.text
+    job = wait_for_job(authed, create.json()["extract_job_id"])
+    assert job["status"] == "succeeded"
+
+
+def test_capability_transfer_rejects_prompt_dataset_for_system_pair_before_queue(authed: TestClient) -> None:
+    dataset_id = upload_and_approve_calibration_dataset(authed)
+
+    response = _post_capability_transfer(authed, dataset_id, "system_pair")
+
+    assert response.status_code == 400
+    assert "requires system_present, system_absent, and prompt" in response.json()["detail"]
+    assert authed.get("/api/capability-transfers").json() == []
+    assert [job for job in authed.get("/api/jobs").json() if job["job_type"] == "extract_capability"] == []
+
+
+def test_capability_transfer_rejects_system_dataset_for_prompt_pair_before_queue(authed: TestClient) -> None:
+    dataset_id = upload_and_approve_system_calibration_dataset(authed)
+
+    response = _post_capability_transfer(authed, dataset_id, "prompt_pair")
+
+    assert response.status_code == 400
+    assert "requires prompt_present and prompt_absent" in response.json()["detail"]
+    assert authed.get("/api/capability-transfers").json() == []
+    assert [job for job in authed.get("/api/jobs").json() if job["job_type"] == "extract_capability"] == []
+
+
+def _post_capability_transfer(
+    authed: TestClient,
+    dataset_id: str,
+    contrast_mode: str,
+    layer_targets: str = "all",
+) -> Response:
+    return authed.post(
+        "/api/capability-transfers",
+        json={
+            "display_name": "Calibration Mode Test",
+            "source_model_slug": "lfm25-12b-instruct",
+            "source_runtime": "transformers",
+            "target_model_slug": "lfm25-12b-instruct",
+            "target_runtime": "transformers",
+            "calibration_dataset_id": dataset_id,
+            "layer_targets": layer_targets,
+            "contrast_mode": contrast_mode,
+            "rank": 8,
+            "dry_run": True,
+        },
+    )

@@ -28,6 +28,11 @@ from traininghub.services.jobs import JobValidationError, create_and_start_job
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
 
+CALIBRATION_DATASET_TYPE = "capability_calibration"
+CALIBRATION_REMOTE_IMPORT_ERROR = (
+    "capability_calibration datasets must be uploaded from CSV using the calibration template."
+)
+
 
 class TemplateRequest(BaseModel):
     dataset_type: str = "math_sft"
@@ -178,6 +183,7 @@ def import_hf_dataset(
     settings: Annotated[Settings, Depends(settings_dependency)],
     _user: Annotated[dict[str, Any], Depends(current_user)],
 ) -> dict[str, Any]:
+    _ensure_supported_remote_dataset_type(payload.dataset_type)
     _ensure_confirmed_sha(payload.repo_id, "dataset", payload.confirmed_sha, payload.revision)
     job_payload = {"source_type": "hf", **payload.model_dump(exclude_none=True)}
     _attach_cleaning_model(settings, job_payload)
@@ -190,6 +196,7 @@ def import_url_dataset(
     settings: Annotated[Settings, Depends(settings_dependency)],
     _user: Annotated[dict[str, Any], Depends(current_user)],
 ) -> dict[str, Any]:
+    _ensure_supported_remote_dataset_type(payload.dataset_type)
     job_payload = {"source_type": "url", **payload.model_dump(exclude_none=True)}
     _attach_cleaning_model(settings, job_payload)
     return _create_job(settings, "dataset_import", f"url-{payload.slug}", job_payload)
@@ -224,6 +231,11 @@ def _create_job(settings: Settings, job_type: str, slug: str, payload: dict[str,
         return create_and_start_job(settings, job_type, slug, payload)
     except JobValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _ensure_supported_remote_dataset_type(dataset_type: str) -> None:
+    if dataset_type.strip() == CALIBRATION_DATASET_TYPE:
+        raise HTTPException(status_code=400, detail=CALIBRATION_REMOTE_IMPORT_ERROR)
 
 
 def _attach_cleaning_model(settings: Settings, payload: dict[str, Any]) -> None:

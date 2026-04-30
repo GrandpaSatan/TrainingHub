@@ -80,7 +80,10 @@ export function CapabilityTransferWizard({
   const source = candidates.find((item) => item.id === sourceId);
   const targets = useMemo(() => candidates.filter((item) => item.id !== sourceId && targetAllowed(source, item)), [candidates, sourceId]);
   const target = targets.find((item) => item.id === targetId);
-  const approvedDatasets = useMemo(() => datasets.filter((dataset) => dataset.approved), [datasets]);
+  const approvedDatasets = useMemo(
+    () => datasets.filter((dataset) => dataset.approved && dataset.dataset_type === "capability_calibration"),
+    [datasets]
+  );
   const selectedTransfer = transfers.find((item) => item.transfer_id === selectedTransferId) || transfers[0];
   const extractJob = selectedTransfer?.extract_job_id ? jobs.find((job) => job.job_id === selectedTransfer.extract_job_id) : undefined;
   const alignJob = selectedTransfer?.align_job_id ? jobs.find((job) => job.job_id === selectedTransfer.align_job_id) : undefined;
@@ -102,6 +105,10 @@ export function CapabilityTransferWizard({
   }, [targetId, targets]);
 
   useEffect(() => {
+    if (datasetId && !approvedDatasets.some((dataset) => dataset.dataset_id === datasetId)) {
+      setDatasetId("");
+      return;
+    }
     if (!datasetId && approvedDatasets.length > 0) {
       setDatasetId(approvedDatasets[0].dataset_id);
     }
@@ -273,7 +280,7 @@ export function CapabilityTransferWizard({
                 ))}
                 {approvedDatasets.length === 0 && <div className="thx-empty">NO APPROVED CALIBRATION DATASETS</div>}
               </div>
-              <FieldNote note="Calibration JSONL needs prompt_present and prompt_absent fields, or system_present and system_absent for system-pair mode." link="#calibration-pairs" />
+              <FieldNote note="Only approved capability_calibration datasets are shown here. Upload one from the Calibration template if this list is empty." link="#calibration-pairs" />
             </WizardSection>
           )}
 

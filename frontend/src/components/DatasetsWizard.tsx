@@ -40,8 +40,11 @@ import "../styles/cyberpunk.css";
 
 type Source = "huggingface" | "csv" | "url";
 type StepKey = "source" | "ingest" | "process" | "inspect" | "approve" | "library";
-type DatasetType = "math_sft" | "chat_sft" | "holdout";
+type DatasetType = "math_sft" | "chat_sft" | "holdout" | "capability_calibration";
 type FormErrors = Record<string, string>;
+
+const REMOTE_DATASET_TYPES: DatasetType[] = ["math_sft", "chat_sft", "holdout"];
+const CSV_DATASET_TYPES: DatasetType[] = [...REMOTE_DATASET_TYPES, "capability_calibration"];
 
 type HubSearchHit = {
   id: string;
@@ -100,9 +103,9 @@ const SOURCE_INFO: Record<Source, AsideContent> = {
     stats: [
       { k: "MAX SIZE", v: "Browser limit" },
       { k: "ENCODING", v: "UTF-8" },
-      { k: "TEMPLATE", v: "Three preset shapes" },
+      { k: "TEMPLATE", v: "Four preset shapes" },
     ],
-    note: "Templates exist for math_sft, chat_sft, and benchmark holdout. Download one if your CSV is from scratch.",
+    note: "Templates exist for math_sft, chat_sft, benchmark holdout, and capability calibration. Download one if your CSV is from scratch.",
   },
   url: {
     meta: "ORIGIN · 01C",
@@ -132,6 +135,24 @@ function fmtBytes(n: number | undefined): string {
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)} KB`;
   return `${n} B`;
+}
+
+function datasetTypeLabel(type: DatasetType): string {
+  if (type === "math_sft") return "Math SFT";
+  if (type === "chat_sft") return "Chat SFT";
+  if (type === "holdout") return "Holdout";
+  return "Calibration";
+}
+
+function datasetTypeSubcopy(type: DatasetType): string {
+  if (type === "math_sft") return "Reasoning + answer";
+  if (type === "chat_sft") return "Multi-turn chat";
+  if (type === "holdout") return "Benchmark only";
+  return "Contrast pairs";
+}
+
+function datasetTypesForSource(source: Source): DatasetType[] {
+  return source === "csv" ? CSV_DATASET_TYPES : REMOTE_DATASET_TYPES;
 }
 
 function slugify(value: string): string {
@@ -308,6 +329,12 @@ export function DatasetsWizard({
   function goPrev() {
     const i = STEPS.findIndex((s) => s.key === step);
     if (i > 0) go(STEPS[i - 1].key);
+  }
+  function selectSource(nextSource: Source) {
+    setSource(nextSource);
+    if (nextSource !== "csv" && datasetType === "capability_calibration") {
+      setDatasetType("math_sft");
+    }
   }
 
   // ---- HF search (calls public HF api directly)
@@ -714,7 +741,7 @@ export function DatasetsWizard({
                       key={s}
                       type="button"
                       className={"thx-card" + (source === s ? " is-selected" : "")}
-                      onClick={() => setSource(s)}
+                      onClick={() => selectSource(s)}
                       {...hover(SOURCE_INFO[s])}
                     >
                       <div className="thx-card-row">
@@ -744,16 +771,16 @@ export function DatasetsWizard({
                   <span className="thx-tag">[ SCHEMA · CANONICAL ]</span>
                 </div>
                 <div className="thx-seg">
-                  {(["math_sft", "chat_sft", "holdout"] as DatasetType[]).map((t) => (
+                  {datasetTypesForSource(source).map((t) => (
                     <button
                       key={t}
                       type="button"
                       className={"thx-seg-item" + (datasetType === t ? " is-active" : "")}
                       onClick={() => setDatasetType(t)}
                     >
-                      {t === "math_sft" ? "Math SFT" : t === "chat_sft" ? "Chat SFT" : "Holdout"}
+                      {datasetTypeLabel(t)}
                       <span className="sub">
-                        {t === "math_sft" ? "Reasoning + answer" : t === "chat_sft" ? "Multi-turn chat" : "Benchmark only"}
+                        {datasetTypeSubcopy(t)}
                       </span>
                     </button>
                   ))}

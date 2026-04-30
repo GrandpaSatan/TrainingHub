@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from conftest import valid_math_csv
+from conftest import valid_calibration_csv, valid_math_csv
 from conftest import wait_for_job
 
 
@@ -14,6 +14,62 @@ def test_template_download(authed: TestClient) -> None:
     response = authed.post("/api/datasets/template", json={"dataset_type": "math_sft"})
     assert response.status_code == 200
     assert "prompt,response,final_answer" in response.text
+
+
+def test_capability_calibration_template_download(authed: TestClient) -> None:
+    response = authed.post("/api/datasets/template", json={"dataset_type": "capability_calibration"})
+    assert response.status_code == 200
+    assert "prompt_present,prompt_absent" in response.text
+
+
+def test_upload_capability_calibration_dataset(authed: TestClient) -> None:
+    response = authed.post(
+        "/api/datasets/upload",
+        files={"file": ("calibration.csv", valid_calibration_csv(), "text/csv")},
+        data={
+            "dataset_type": "capability_calibration",
+            "title": "Calibration",
+            "slug": "calibration",
+            "max_sequence_length": "2048",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["created"] is True
+    assert body["validation"]["accepted_count"] == 2
+    dataset_id = body["dataset_id"]
+    approve = authed.post(f"/api/datasets/{dataset_id}/approve")
+    assert approve.status_code == 200
+    sample = authed.get(f"/api/datasets/{dataset_id}/review-sample?sample_size=1")
+    assert sample.status_code == 200
+    assert sample.json()["records"][0]["prompt"].startswith("Think step by step")
+
+
+def test_upload_capability_calibration_blank_split_defaults_to_holdout(authed: TestClient) -> None:
+    csv_bytes = (
+        "id,prompt_present,prompt_absent,continuation_prefix,system_present,system_absent,prompt,source,split,tags,notes\n"
+        "cal_blank,Think step by step: What is 3 + 4?,Answer directly: What is 3 + 4?,,,,,manual,,calibration,\n"
+    ).encode("utf-8")
+    response = authed.post(
+        "/api/datasets/upload",
+        files={"file": ("calibration.csv", csv_bytes, "text/csv")},
+        data={
+            "dataset_type": "capability_calibration",
+            "title": "Blank Split Calibration",
+            "slug": "blank-split-calibration",
+            "max_sequence_length": "2048",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created"] is True
+    assert body["validation"]["rows"][0]["split"] == "holdout"
+
+    dataset = next(item for item in authed.get("/api/datasets").json() if item["title"] == "Blank Split Calibration")
+    assert dataset["split_counts"] == {"holdout": 1}
+    sample = authed.get(f"/api/datasets/{dataset['dataset_id']}/review-sample?sample_size=1")
+    assert sample.status_code == 200
+    assert sample.json()["records"][0]["metadata"]["split"] == "holdout"
 
 
 def test_upload_validation_errors(authed: TestClient) -> None:
@@ -32,6 +88,40 @@ def test_upload_validation_errors(authed: TestClient) -> None:
     assert body["created"] is False
     codes = {error["code"] for error in body["validation"]["errors"]}
     assert {"required", "invalid_split", "duplicate_id"}.issubset(codes)
+
+
+def test_hf_import_rejects_capability_calibration_before_queue(authed: TestClient) -> None:
+    response = authed.post(
+        "/api/datasets/import-hf",
+        json={
+            "repo_id": "acme/math",
+            "title": "Calibration HF",
+            "slug": "calibration-hf",
+            "dataset_type": "capability_calibration",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "uploaded from CSV" in response.json()["detail"]
+    assert [job for job in authed.get("/api/jobs").json() if job["job_type"] == "dataset_import"] == []
+
+
+def test_url_import_rejects_capability_calibration_before_queue(authed: TestClient, tmp_path: Path) -> None:
+    source = tmp_path / "rows.jsonl"
+    source.write_text(json.dumps({"question": "What is 1 + 1?", "answer": "2"}) + "\n", encoding="utf-8")
+    response = authed.post(
+        "/api/datasets/import-url",
+        json={
+            "url": source.as_uri(),
+            "title": "Calibration URL",
+            "slug": "calibration-url",
+            "dataset_type": "capability_calibration",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "uploaded from CSV" in response.json()["detail"]
+    assert [job for job in authed.get("/api/jobs").json() if job["job_type"] == "dataset_import"] == []
 
 
 def test_upload_and_approve_dataset(authed: TestClient) -> None:

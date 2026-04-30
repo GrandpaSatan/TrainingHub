@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from traininghub.services.calibration_pairs import load_calibration_pairs
 from traininghub.services.capability_transfers import mark_extracted, update_transfer_status
 from traininghub.services.model_introspection import normalize_layer_targets, transformer_layers
 from traininghub.services.inference_run import _local_model_path_from_provider_id
@@ -58,7 +58,7 @@ def _extract_transformers(context: WorkerContext, payload: dict[str, Any]) -> di
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    pairs = _load_calibration_pairs(Path(str(payload["dataset_jsonl_path"])), str(payload.get("contrast_mode") or "prompt_pair"))
+    pairs = load_calibration_pairs(Path(str(payload["dataset_jsonl_path"])), str(payload.get("contrast_mode") or "prompt_pair"))
     if not pairs:
         raise RuntimeError("Calibration dataset has no usable capability contrast pairs.")
     model_id = _resolve_model_source(str(payload.get("source_model_id") or payload["source_model_slug"]))
@@ -116,7 +116,7 @@ def _extract_llama_cpp(context: WorkerContext, payload: dict[str, Any]) -> dict[
         from llama_cpp import Llama
     except ImportError as exc:
         raise RuntimeError("llama-cpp-python is required for GGUF capability extraction.") from exc
-    pairs = _load_calibration_pairs(Path(str(payload["dataset_jsonl_path"])), str(payload.get("contrast_mode") or "prompt_pair"))
+    pairs = load_calibration_pairs(Path(str(payload["dataset_jsonl_path"])), str(payload.get("contrast_mode") or "prompt_pair"))
     model_path = Path(str(payload.get("source_artifact_path") or "")).expanduser()
     if not model_path.is_file():
         raise RuntimeError(f"GGUF source artifact not found: {model_path}")
@@ -172,30 +172,6 @@ def _capture_layers(model: Any, tokenizer: Any, text: str, selected_layers: list
         for handle in handles:
             handle.remove()
     return {layer: captures[layer].numpy()[0] for layer in selected_layers}
-
-
-def _load_calibration_pairs(path: Path, contrast_mode: str) -> list[dict[str, str]]:
-    pairs: list[dict[str, str]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            prefix = str(row.get("continuation_prefix") or row.get("prefix") or "")
-            if contrast_mode == "system_pair":
-                present = str(row.get("system_present") or "").strip()
-                absent = str(row.get("system_absent") or "").strip()
-                prompt = str(row.get("prompt") or prefix).strip()
-                if present and absent and prompt:
-                    pairs.append({"present": f"{present}\n\n{prompt}", "absent": f"{absent}\n\n{prompt}"})
-                    continue
-            present = str(row.get("prompt_present") or "").strip()
-            absent = str(row.get("prompt_absent") or "").strip()
-            if present and absent:
-                pairs.append({"present": present + prefix, "absent": absent + prefix})
-                continue
-            raise RuntimeError(f"Calibration row {line_number} is missing prompt_present/prompt_absent fields.")
-    return pairs
 
 
 def _resolve_model_source(model_slug: str) -> str:
